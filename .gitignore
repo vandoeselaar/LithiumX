@@ -10,3 +10,4 @@ dash.xml
 *.exe
 *.iso
 *.inl
+.DS_Store
