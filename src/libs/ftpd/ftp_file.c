@@ -139,6 +139,13 @@ FRESULT ftps_f_stat(const char *path, FILINFO *nfo)
 		return FR_NO_FILE;
 	}
 
+	// If we got a valid handle but invalid attributes (unlikely), still clean up
+	if (attr == INVALID_FILE_ATTRIBUTES)
+	{
+		CloseHandle(hfile);
+		return FR_NO_FILE;
+	}
+
 	// Apply the files attributes
 	nfo->fattrib = win_to_ftps_attr(attr);
 
@@ -300,7 +307,6 @@ static HANDLE async_writer_semaphore;
 static async_writer_mbox_item_t async_writer_mbox[ASYNC_WRITE_MBOX_SIZE];
 static atomic_size_t async_writer_mbox_head;
 static atomic_size_t async_writer_mbox_tail;
-static int async_writer_init = 1;
 
 static DWORD WINAPI async_writer_thread(LPVOID lpThreadParameter)
 {
@@ -323,8 +329,11 @@ static DWORD WINAPI async_writer_thread(LPVOID lpThreadParameter)
 FRESULT ftps_f_open(FIL *fp, const char *path, uint8_t mode)
 {
 	// FIXME: Have a way to close the async writer thread
-	if (async_writer_init) {
-		async_writer_init = 0;
+	// Use atomic compare-and-swap so only one thread initialises the writer,
+	// even when multiple FTP clients open files simultaneously.
+	static atomic_int async_writer_init_atomic = 1;
+	int expected = 1;
+	if (atomic_compare_exchange_strong(&async_writer_init_atomic, &expected, 0)) {
 		memset(async_writer_mbox, 0, sizeof(async_writer_mbox));
 		async_writer_mbox_head = 0;
 		async_writer_mbox_tail = 0;

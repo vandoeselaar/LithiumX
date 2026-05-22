@@ -25,7 +25,12 @@ static int dash_settings_read_callback(void *param, int argc, char **argv, char 
     if (_dash_settings->magic == DASH_SETTINGS_MAGIC)
     {
         lv_memcpy(&dash_settings, argv[0], sizeof(dash_settings));
+        // background_colour: bit 24 (DASH_BG_COLOUR_FLAG) geeft aan of een
+        // kleur ingesteld is. Geen vlag = geen aangepaste achtergrond.
+        // Nul (verse blob) heeft de vlag niet — correct default gedrag.
     }
+    // Bij magic mismatch blijft dash_settings.background_colour == 0
+    // (zero-init van de global) wat correct is: vlag niet gezet = geen custom bg.
     return 0;
 }
 
@@ -233,11 +238,11 @@ static void change_max_recent_submenu(void *param)
 #define COLOR_TABLE_VER_CNT ((100 / COLOR_TABLE_VALUE_RESOLUTION) - COLOR_HSV_MIN_V)
 lv_color_t *hsv_colors;
 
-static void get_grid_from_rgb(lv_color_t rgb, int *row, int *col)
+static void get_grid_from_rgb_buf(lv_color_t *buf, lv_color_t rgb, int *row, int *col)
 {
     for (int i = 0; i < (COLOR_TABLE_HOR_CNT * COLOR_TABLE_VER_CNT); i++)
     {
-        lv_color_t rgb_check = hsv_colors[i];
+        lv_color_t rgb_check = buf[i];
         if (memcmp(&rgb_check, &rgb, sizeof(lv_color_t)) == 0)
         {
             int c = i % COLOR_TABLE_HOR_CNT;
@@ -252,6 +257,12 @@ static void get_grid_from_rgb(lv_color_t rgb, int *row, int *col)
     lv_color_hsv_t hsv = lv_color_rgb_to_hsv(rgb.ch.red, rgb.ch.green, rgb.ch.blue);
     *col = hsv.h / COLOR_TABLE_HUE_RESOLUTION;
     *row = hsv.v / COLOR_TABLE_VALUE_RESOLUTION;
+}
+
+// Wrapper voor de theme colour picker (gebruikt hsv_colors)
+static void get_grid_from_rgb(lv_color_t rgb, int *row, int *col)
+{
+    get_grid_from_rgb_buf(hsv_colors, rgb, row, col);
 }
 
 static void base_color_change_submenu_callback(lv_event_t *event)
@@ -364,6 +375,122 @@ static void change_search_path_submenu(void *param)
                             " Then rebuild database", DASH_SEARCH_PATH_CONFIG);
 }
 
+// ── Achtergrondkleur submenu ─────────────────────────────────────────────────
+// background_colour in dash_settings wordt opgeslagen als 0x00RRGGBB,
+// dezelfde conventie als theme_colour. Waarde -1 betekent "geen aangepaste
+// achtergrond" (scherm blijft zwart / default).
+
+static lv_color_t *bg_hsv_colors = NULL;
+
+static void bg_color_draw_hsv(lv_event_t *e)
+{
+    lv_obj_draw_part_dsc_t *dsc = lv_event_get_draw_part_dsc(e);
+    lv_obj_draw_part_dsc_t *pdsc = lv_event_get_param(e);
+    lv_table_t *table = (lv_table_t *)lv_event_get_target(e);
+
+    dsc->rect_dsc->bg_color = bg_hsv_colors[pdsc->id];
+
+    unsigned int id = (table->row_act * COLOR_TABLE_HOR_CNT) + table->col_act;
+    if (pdsc->id == id)
+    {
+        dsc->rect_dsc->border_color = lv_color_white();
+        dsc->rect_dsc->border_width = 1;
+    }
+}
+
+static void bg_hsv_table_clean(lv_event_t *e)
+{
+    (void)e;
+    lv_mem_free(bg_hsv_colors);
+    bg_hsv_colors = NULL;
+}
+
+static void bg_color_change_callback(lv_event_t *event)
+{
+    lv_obj_t *target     = lv_event_get_target(event);
+    lv_obj_t *color_rect = lv_event_get_user_data(event);
+    lv_table_t *table    = (lv_table_t *)target;
+    lv_key_t key         = *((lv_key_t *)lv_event_get_param(event));
+
+    lv_color_t c = bg_hsv_colors[(table->row_act * table->col_cnt) + table->col_act];
+    lv_obj_set_style_bg_color(color_rect, c, LV_PART_MAIN);
+
+    dash_settings.background_colour = DASH_BG_COLOUR_PACK(c.ch.red, c.ch.green, c.ch.blue);
+
+    if (key == LV_KEY_ENTER)
+    {
+        // Pas direct toe op het scherm — geen reboot nodig.
+        // Zet ook gradient uit zodat de effen kleur niet overstemd wordt.
+        lv_obj_set_style_bg_color(lv_scr_act(), c, LV_PART_MAIN);
+        lv_obj_set_style_bg_grad_dir(lv_scr_act(), LV_GRAD_DIR_NONE, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, LV_PART_MAIN);
+        dash_settings_apply(true);
+    }
+}
+
+
+static void change_background_colour_submenu(void *param)
+{
+    (void)param;
+    lv_obj_t *c = container_open();
+
+    // Kleurrooster — zelfde opzet als de theme colour picker
+    lv_obj_t *bg_table = lv_table_create(c);
+    lv_obj_align(bg_table, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_border_width(bg_table, 0, LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(bg_table, LV_OPA_50, LV_PART_MAIN);
+
+    lv_table_set_col_cnt(bg_table, COLOR_TABLE_HOR_CNT);
+    lv_table_set_row_cnt(bg_table, COLOR_TABLE_VER_CNT);
+    lv_obj_set_style_min_height(bg_table, 250 / COLOR_TABLE_VER_CNT, LV_PART_ITEMS);
+    lv_obj_set_style_max_height(bg_table, 250 / COLOR_TABLE_VER_CNT, LV_PART_ITEMS);
+    for (int i = 0; i < COLOR_TABLE_HOR_CNT; i++)
+    {
+        lv_table_set_col_width(bg_table, i, lv_obj_get_width(c) / COLOR_TABLE_HOR_CNT);
+    }
+    lv_obj_update_layout(bg_table);
+
+    bg_hsv_colors = lv_mem_alloc(COLOR_TABLE_HOR_CNT * COLOR_TABLE_VER_CNT * sizeof(lv_color_t));
+    for (int i = 0; i < (COLOR_TABLE_HOR_CNT * COLOR_TABLE_VER_CNT); i++)
+    {
+        int col = i % COLOR_TABLE_HOR_CNT;
+        int row = i / COLOR_TABLE_HOR_CNT;
+        lv_color_hsv_t hsv;
+        hsv.s = 100;
+        hsv.h = col * COLOR_TABLE_HUE_RESOLUTION;
+        hsv.v = (row + COLOR_HSV_MIN_V) * COLOR_TABLE_VALUE_RESOLUTION;
+        bg_hsv_colors[i] = lv_color_hsv_to_rgb(hsv.h, hsv.s, hsv.v);
+    }
+    lv_obj_add_event_cb(bg_table, bg_color_draw_hsv, LV_EVENT_DRAW_PART_BEGIN, NULL);
+    lv_obj_add_event_cb(bg_table, bg_hsv_table_clean, LV_EVENT_DELETE, NULL);
+
+    // Zet cursor op huidige achtergrondkleur (of zwart als niet ingesteld)
+    lv_color_t current_bg = DASH_BG_COLOUR_IS_SET(dash_settings.background_colour)
+        ? lv_color_make(DASH_BG_COLOUR_R(dash_settings.background_colour),
+                        DASH_BG_COLOUR_G(dash_settings.background_colour),
+                        DASH_BG_COLOUR_B(dash_settings.background_colour))
+        : lv_color_black();
+
+    int row, col;
+    get_grid_from_rgb_buf(bg_hsv_colors, current_bg, &row, &col);
+    ((lv_table_t *)bg_table)->row_act = row;
+    ((lv_table_t *)bg_table)->col_act = col;
+
+    // Preview-rechthoek
+    lv_obj_t *rect = lv_obj_create(c);
+    lv_obj_add_style(rect, &object_style, LV_PART_MAIN);
+    lv_obj_set_size(rect, 50, 50);
+    lv_obj_align(rect, LV_ALIGN_TOP_MID, 0, lv_obj_get_y2(bg_table) + 10);
+    lv_obj_set_style_bg_color(rect, current_bg, LV_PART_MAIN);
+
+    lv_obj_add_event_cb(bg_table, bg_color_change_callback, LV_EVENT_KEY, rect);
+
+    // Info label
+    lv_obj_t *label = lv_label_create(c);
+    lv_label_set_text_static(label, "Applies on\nReboot");
+    lv_obj_align(label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+}
+
 void dash_settings_open()
 {
     static menu_items_t items[] =
@@ -376,6 +503,7 @@ void dash_settings_open()
             {"Change Max Recent Items Shown", change_max_recent_submenu, NULL, NULL},
             {"Change Default Start Up Page", change_startup_page_submenu, NULL, NULL},
             {"Change Base Theme Color", change_base_color_submenu, NULL, NULL},
+            {"Change Background Color", change_background_colour_submenu, NULL, NULL},
             {"Change Folder Search Paths", change_search_path_submenu, NULL, NULL},
         };
 

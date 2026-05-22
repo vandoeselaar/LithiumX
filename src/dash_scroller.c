@@ -451,6 +451,11 @@ static int db_scan_thread_f(void *param)
     item_strings_callback_t item_cb;
     lv_memset(&item_cb, 0, sizeof(item_strings_callback_t));
 
+    // Toon laad status over de splash
+    char status_buf[64];
+    lv_snprintf(status_buf, sizeof(status_buf), "Loading: %s", p->page_title);
+    platform_splash_set_status(status_buf);
+
     if (strcmp(p->page_title, "Recent") == 0)
     {
         lv_snprintf(cmd, sizeof(cmd), SQL_TITLE_GET_RECENT,
@@ -482,6 +487,29 @@ static int db_scan_thread_f(void *param)
         lv_mem_free(item_cb.head);
         item_cb.head = next_item;
     }
+
+    // Markeer deze thread als klaar.
+    p->scan_done = true;
+
+    // Controleer of alle pagina scan-threads klaar zijn.
+    // Als dat zo is, verwijder de splash overlay.
+    if (splash_active) {
+        bool all_done = true;
+        for (int i = 0; i < DASH_MAX_PAGES; i++) {
+            if (parsers[i] == NULL) continue;
+            // Thread is klaar als db_scan_thread NULL is of als SDL
+            // de thread al heeft afgerond. We gebruiken een simpele
+            // teller via een atomaire vlag in parse_handle_t.
+            if (!parsers[i]->scan_done) {
+                all_done = false;
+                break;
+            }
+        }
+        if (all_done) {
+            platform_splash_done();
+        }
+    }
+
     return 0;
 }
 

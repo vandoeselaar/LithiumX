@@ -747,7 +747,9 @@ typedef enum {
     XGU_MATERIAL_SOURCE_VERTEX_SPECULAR = 2
 } XguMaterialSource;
 
+#ifndef NV097_SET_COLOR_MATERIAL
 #define NV097_SET_COLOR_MATERIAL   0x0298
+#endif
 
 XGU_API
 uint32_t* xgu_set_color_material(uint32_t* p, XguMaterialSource emissive, XguMaterialSource ambient, XguMaterialSource diffuse, XguMaterialSource specular, XguMaterialSource back_emissive, XguMaterialSource back_ambient, XguMaterialSource back_diffuse, XguMaterialSource back_specular) {

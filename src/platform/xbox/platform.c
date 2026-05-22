@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <xboxkrnl/xboxkrnl.h>
 #include <nxdk/format.h>
 #include <nxdk/mount.h>
@@ -10,6 +11,8 @@
 
 #include <time.h>
 #include <stdlib.h>
+#include <setjmp.h>
+#include <jpeglib.h>
 #include <lvgl.h>
 #include "lithiumx.h"
 #include "../platform.h"
@@ -23,8 +26,67 @@
 #include "ftpd/ftp.h"
 #include "xbox_info.h"
 
-static ULONG platform_cpu_temp, platform_mb_temp, platform_tray_state = 0x70;
-static UCHAR platform_temp_unit;
+ULONG platform_cpu_temp, platform_mb_temp, platform_tray_state = 0x70;
+UCHAR platform_temp_unit;
+
+// Splash overlay state
+uint32_t *splash_fb_buf = NULL;   // was: static uint32_t *splash_fb_buf
+int splash_screen_w = 0;          // was: static int splash_screen_w
+int splash_screen_h = 0;          // was: static int splash_screen_h
+volatile bool splash_active = false;
+
+static char splash_status_msg[128] = {0};
+
+void platform_splash_set_status(const char *msg)
+{
+    strncpy(splash_status_msg, msg, sizeof(splash_status_msg) - 1);
+}
+
+static void splash_draw_status(int sw, int sh)
+{
+    if (!splash_status_msg[0]) return;
+    int text_x = sw / 2 - ((int)strlen(splash_status_msg) / 2 * 8);
+    int text_y = sh * 80 / 100;  
+    debugMoveCursor(text_x, text_y);
+    debugPrint("%s", splash_status_msg);
+}
+
+void platform_splash_overlay(void)
+{
+    if (!splash_active || !splash_fb_buf) return;
+
+    while (pb_busy()) {}
+    while (pb_finished()) {}
+
+    uint32_t *bb = (uint32_t *)pb_back_buffer();
+    if (!bb) return;
+
+    memcpy(bb, splash_fb_buf, splash_screen_w * splash_screen_h * 4);
+    splash_draw_status(splash_screen_w, splash_screen_h);
+    pb_wait_for_vbl();   // swap backbuffer → frontbuffer
+}
+
+void platform_splash_done(void)
+{
+    splash_active = false;
+    if (splash_fb_buf) {
+        free(splash_fb_buf);
+        splash_fb_buf = NULL;
+    }
+}
+
+// Pre-LVGL: herstel splash + toon status tekst direct op framebuffer
+static void splash_print_status(int sw, int sh, const char *msg)
+{
+    if (!splash_fb_buf) return;
+    uint32_t *fb = (uint32_t *)XVideoGetFB();
+    if (!fb) return;
+    memcpy(fb, splash_fb_buf, sw * sh * 4);
+    strncpy(splash_status_msg, msg, sizeof(splash_status_msg) - 1);
+    splash_draw_status(sw, sh);
+    //Sleep(500);
+}
+
 
 void xbox_sntp_set_time(uint32_t ntp_s)
 {
@@ -95,6 +157,191 @@ static WINAPI DWORD network_startup(LPVOID param)
     return 0;
 }
 
+struct splash_error_mgr {
+    struct jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+static void splash_error_exit(j_common_ptr cinfo)
+{
+    struct splash_error_mgr *err = (struct splash_error_mgr *)cinfo->err;
+    longjmp(err->setjmp_buffer, 1);
+}
+
+// Laad Q:\splash.jpg en teken het gecentreerd op de framebuffer.
+// Wordt aangeroepen direct na XVideoSetMode(), vóór enige andere init.
+// Geen LVGL of SDL nodig. Stille fallback als het bestand ontbreekt.
+static void show_splash(int screen_w, int screen_h)
+{
+    // CD-ROM driver staat maar 1 handle tegelijk toe.
+    // FindFirstFile openen en direct sluiten voor we fopen aanroepen.
+    WIN32_FIND_DATA fd;
+    HANDLE h = FindFirstFile("D:\\splash.jpg", &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        debugPrint("splash: niet gevonden\n");
+        return;
+    }
+    FindClose(h);
+
+    FILE *fp = fopen("D:\\splash.jpg", "rb");
+    debugPrint("splash fp=%p\n", fp);
+    if (!fp) return;
+
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    rewind(fp);
+    debugPrint("splash size=%ld\n", size);
+    if (size <= 0) { fclose(fp); return; }
+
+    struct jpeg_decompress_struct jinfo;
+    struct splash_error_mgr jerr;
+
+    jinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = splash_error_exit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&jinfo);
+        fclose(fp);
+        return;
+    }
+
+    jpeg_create_decompress(&jinfo);
+    jpeg_stdio_src(&jinfo, fp);
+
+    if (jpeg_read_header(&jinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&jinfo);
+        fclose(fp);
+        return;
+    }
+
+    // Gebruik libjpeg ingebouwde schaling (1/8 t/m 8/8) om zo dicht mogelijk
+    // bij de schermresolutie te komen — snel en zonder extra geheugen.
+    // We kiezen de kleinste schaalfactor waarbij de afbeelding nog groter is
+    // dan het scherm, zodat de software-scale daarna alleen hoeft te verkleinen.
+    jinfo.scale_num = 1;
+    jinfo.scale_denom = 8;
+    for (int denom = 8; denom >= 1; denom--) {
+        jinfo.scale_num = denom;
+        jinfo.scale_denom = 8;
+        jpeg_calc_output_dimensions(&jinfo);
+        if ((int)jinfo.output_width >= screen_w || (int)jinfo.output_height >= screen_h) {
+            break;
+        }
+    }
+
+    // Decodeer naar BGRA (32-bit), zelfde als jpg_decoder.c
+    jinfo.out_color_space = JCS_EXT_BGRA;
+    jinfo.do_fancy_upsampling = FALSE;
+    jinfo.do_block_smoothing = FALSE;
+    jinfo.dct_method = JDCT_FASTEST;
+    jpeg_start_decompress(&jinfo);
+
+    int img_w = (int)jinfo.output_width;
+    int img_h = (int)jinfo.output_height;
+    int row_stride = img_w * 4; // 4 bytes per pixel (BGRA)
+
+    uint8_t *img_buf = malloc(img_w * img_h * 4);
+    if (!img_buf) {
+        jpeg_destroy_decompress(&jinfo);
+        fclose(fp);
+        return;
+    }
+
+    while ((int)jinfo.output_scanline < img_h) {
+        uint8_t *row = img_buf + jinfo.output_scanline * row_stride;
+        jpeg_read_scanlines(&jinfo, &row, 1);
+    }
+
+    jpeg_finish_decompress(&jinfo);
+    jpeg_destroy_decompress(&jinfo);
+    fclose(fp);
+
+    // Schrijf naar Xbox framebuffer
+    // XVideoGetFB() geeft een pointer naar het actieve framebuffer (XRGB8888)
+    // BGRA van jpeglib → XRGB van Xbox: bytes zijn [B,G,R,A] vs [B,G,R,X] — volgorde is identiek
+    uint32_t *fb = (uint32_t *)XVideoGetFB();
+    if (!fb) {
+        free(img_buf);
+        return;
+    }
+
+    // Centreer de afbeelding op het scherm
+    int offset_x = (screen_w - img_w) / 2;
+    int offset_y = (screen_h - img_h) / 2;
+
+    // Clamp zodat we niet buiten het scherm schrijven
+    int src_x = 0, src_y = 0;
+    int dst_x = offset_x, dst_y = offset_y;
+    int copy_w = img_w, copy_h = img_h;
+
+    if (dst_x < 0) { src_x = -dst_x; copy_w += dst_x; dst_x = 0; }
+    if (dst_y < 0) { src_y = -dst_y; copy_h += dst_y; dst_y = 0; }
+    if (dst_x + copy_w > screen_w) copy_w = screen_w - dst_x;
+    if (dst_y + copy_h > screen_h) copy_h = screen_h - dst_y;
+
+    for (int y = 0; y < copy_h; y++) {
+        uint32_t *src_row = (uint32_t *)(img_buf + (src_y + y) * row_stride) + src_x;
+        uint32_t *dst_row = fb + (dst_y + y) * screen_w + dst_x;
+        memcpy(dst_row, src_row, copy_w * 4);
+    }
+
+
+    // Bereken schaalfactor met behoud van aspect ratio (letterbox/pillarbox)
+    // Gebruik integer fixed-point (16.16) voor snelheid op de Xbox CPU
+    int scale_x = (img_w << 16) / screen_w;
+    int scale_y = (img_h << 16) / screen_h;
+    int scale = scale_x > scale_y ? scale_x : scale_y; // grootste = volledige scherm vullen
+
+    int out_w = (img_w << 16) / scale;
+    int out_h = (img_h << 16) / scale;
+
+    // Centreer op het scherm
+    int dst_x0 = (screen_w - out_w) / 2;
+    int dst_y0 = (screen_h - out_h) / 2;
+
+    // Teken scherm rij voor rij met nearest-neighbor sampling
+    for (int dy = 0; dy < screen_h; dy++) {
+        uint32_t *dst_row = fb + dy * screen_w;
+
+        // Buiten de afbeelding: zwart
+        if (dy < dst_y0 || dy >= dst_y0 + out_h) {
+            memset(dst_row, 0, screen_w * 4);
+            continue;
+        }
+
+        int sy = ((dy - dst_y0) * scale) >> 16;
+        if (sy >= img_h) sy = img_h - 1;
+        uint32_t *src_row = (uint32_t *)(img_buf + sy * row_stride);
+
+        // Links van de afbeelding: zwart
+        for (int dx = 0; dx < dst_x0 && dx < screen_w; dx++) {
+            dst_row[dx] = 0;
+        }
+
+        // Afbeelding pixels
+        for (int dx = dst_x0; dx < dst_x0 + out_w && dx < screen_w; dx++) {
+            int sx = ((dx - dst_x0) * scale) >> 16;
+            if (sx >= img_w) sx = img_w - 1;
+            dst_row[dx] = src_row[sx];
+        }
+
+        // Rechts van de afbeelding: zwart
+        for (int dx = dst_x0 + out_w; dx < screen_w; dx++) {
+            dst_row[dx] = 0;
+        }
+    }
+    // Bewaar de geschaalde framebuffer inhoud als splash overlay.
+    splash_fb_buf = malloc(screen_w * screen_h * 4);
+    if (splash_fb_buf) {
+        memcpy(splash_fb_buf, fb, screen_w * screen_h * 4);
+        splash_screen_w = screen_w;
+        splash_screen_h = screen_h;
+        splash_active = true;
+    }
+    free(img_buf);
+}
+
+
 void platform_init(int *w, int *h)
 {
     // First try 720p. This is the preferred resolution
@@ -124,11 +371,13 @@ void platform_init(int *w, int *h)
     *w = xmode.width;
     *h = xmode.height;
 
-    // Show a loading screen as early as possible so we indicate some sign of life
-    debugClearScreen();
-    const char *loading_str = "Mounting Partitions";
-    debugMoveCursor(*w / 2 - ((strlen(loading_str) / 2) * 8), *h / 2);
-    debugPrint("%s ", loading_str);
+    // Toon splash zo vroeg mogelijk — vóór partities mounten
+    char xbe_path[256];
+    nxGetCurrentXbeNtPath(xbe_path);
+    Sleep(500);
+    show_splash(*w, *h);
+
+    splash_print_status(*w, *h, "Mounting Partitions...");
 
     // nxdk automounts D to the root xbe path. Lets undo that
     if (nxIsDriveMounted('D'))
@@ -144,7 +393,6 @@ void platform_init(int *w, int *h)
     nxGetCurrentXbeNtPath(targetPath);
     *(strrchr(targetPath, '\\') + 1) = '\0';
     nxMountDrive('Q', targetPath);
-    debugPrint(".");
 
     // Mount stock partitions
     nxMountDrive('C', "\\Device\\Harddisk0\\Partition2\\");
@@ -152,7 +400,6 @@ void platform_init(int *w, int *h)
     nxMountDrive('X', "\\Device\\Harddisk0\\Partition3\\");
     nxMountDrive('Y', "\\Device\\Harddisk0\\Partition4\\");
     nxMountDrive('Z', "\\Device\\Harddisk0\\Partition5\\");
-    debugPrint(".");
 
     // Mount extended partitions
     // NOTE: Both the retail kernel and modified kernels will mount these partitions
@@ -167,7 +414,8 @@ void platform_init(int *w, int *h)
     nxMountDrive('A', "\\Device\\Harddisk0\\Partition12\\");
     nxMountDrive('B', "\\Device\\Harddisk0\\Partition13\\");
     nxMountDrive('P', "\\Device\\Harddisk0\\Partition14\\");
-    debugPrint(".");
+
+    splash_print_status(*w, *h, "Starting Services...");
 
     CreateDirectoryA("E:\\UDATA", NULL);
     CreateDirectoryA("E:\\UDATA\\LithiumX", NULL);
@@ -177,8 +425,6 @@ void platform_init(int *w, int *h)
         fprintf(fp, "TitleName=LithiumX Dashboard\r\n");
         fclose(fp);
     }
-    debugPrint(".");
-
     // CreateThread for autolaunch_dvd
     CreateThread(NULL, 0, autolaunch_dvd, NULL, 0, NULL);
     CreateThread(NULL, 0, network_startup, NULL, 0, NULL);

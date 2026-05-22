@@ -9,6 +9,13 @@ static uint8_t mem_pool_data[3U * 1024U * 1024U];
 
 static SDL_mutex *lvgl_mutex;
 
+// Actual definitions (allocates memory for them)
+//uint32_t *splash_fb_buf = NULL;
+//int splash_screen_w = 0; 
+//int splash_screen_h = 0;
+
+volatile bool lvgl_frame_ready = false;
+
 keyboard_map_t lvgl_keyboard_map[] =
 {
     {.sdl_map = SDLK_ESCAPE, .lvgl_map = DASH_SETTINGS_PAGE},
@@ -149,22 +156,44 @@ int main(int argc, char* argv[]) {
     lvgl_mutex = SDL_CreateMutex();
     assert(lvgl_mutex);
 
+    // ==========================================
+    // DEONTBREKENDE LVGL INIT BLOK TERUGGEZET:
+    // ==========================================
     dash_printf(LEVEL_TRACE, "Initialising LVGL\n");
     lv_init();
     lv_log_register_print_cb(lvgl_putstring);
-    dash_printf(LEVEL_TRACE, "Initialising Display at w: %d, h: %d\n", w, h);
+    
+    // Start de display driver (dit tekent ook de eerste splash in de backbuffer)
     lv_port_disp_init(w, h);
+    platform_splash_overlay();   // Herstel direct na init, vóór indev en dash_init
+    pb_wait_for_vbl();           // Wacht op VBL zodat de splash zeker zichtbaar is
+    
+    // Start de controller / input driver
     lv_port_indev_init(false);
+    platform_splash_overlay();   // Herstel na LVGL display init
+    // ==========================================
 
     dash_printf(LEVEL_TRACE, "Creating dash\n");
+    platform_splash_set_status("Loading Database...");
     dash_init();
+    platform_splash_overlay(); 
     dash_printf(LEVEL_TRACE, "Enter dash busy loop\n");
 
-    #ifdef NXDK
+#ifdef NXDK
     lv_disp_t *disp = lv_obj_get_disp(lv_scr_act());
     lv_timer_del(disp->refr_timer);
     disp->refr_timer = NULL;
-    #endif
+#endif
+
+    // 1. Deactivate the splash flag so disp_flush is allowed to process the UI
+    extern volatile bool splash_active;
+    splash_active = false;
+
+    // 2. Force LVGL to mark the entire screen as dirty so it definitely 
+    // renders the dashboard components on its very first loop pass.
+    lv_obj_invalidate(lv_scr_act());
+
+    extern volatile bool lvgl_frame_ready;
 
     while (lv_get_quit() == LV_QUIT_NONE)
     {
@@ -173,11 +202,22 @@ int main(int argc, char* argv[]) {
         lvgl_getlock();
         lv_task_handler();
         lvgl_removelock();
+        
         #ifdef NXDK
         lvgl_getlock();
         _lv_disp_refr_timer(NULL);
         lvgl_removelock();
-        pb_wait_for_vbl();
+        
+        // 3. Only swap hardware video registers if a new dashboard frame was fully built
+        if (lvgl_frame_ready)
+        {
+            pb_wait_for_vbl();         // Flip the clean dashboard frame onto the TV
+            lvgl_frame_ready = false;  // Reset token for the next frame
+        }
+        else
+        {
+            SDL_Delay(1);              // Idle safely to prevent pinning the CPU to 100% when UI is static
+        }
         #else
         e = SDL_GetTicks();
         t = e - s;
@@ -187,6 +227,7 @@ int main(int argc, char* argv[]) {
         }
         #endif
     }
+    
     dash_printf(LEVEL_TRACE, "Quitting dash with quit event %d\n", lv_get_quit());
     lv_port_disp_deinit();
     lv_port_indev_deinit();

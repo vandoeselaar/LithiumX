@@ -145,25 +145,31 @@ static int db_rebuild_thread_f(void *param)
     return 0;
 }
 
+// dash_main.c — progress thread: alleen string zetten, geen pbkit aanraken
+// dash_main.c
 static int db_rebuild_progress_thread_f(void *param)
 {
     lv_obj_t *label = param;
     int *complete = label->user_data;
-    while (1)
+
+    while (!*complete)
     {
-        if (*complete)
-        {
-            lv_mem_free(complete);
-            break;
-        }
         extern int db_rebuild_scanned_items;
-        lvgl_getlock();
-        lv_label_set_text_fmt(label, "Rebuilding Database, please wait... %d", db_rebuild_scanned_items);
-        lvgl_removelock();
-        SDL_Delay(100);
+        char msg[64];
+        lv_snprintf(msg, sizeof(msg), "Rebuilding... %d items", db_rebuild_scanned_items);
+        
+        // Alleen de string bijwerken — disp_flush zet de splash op de backbuffer,
+        // debugPrint overlay toont de tekst bovenop elke frame automatisch
+        debugClearScreen();
+        debugPrint("%s", msg);
+
+        SDL_Delay(200);
     }
+
+    lv_mem_free(complete);
     return 0;
 }
+
 
 static char err_msg_toml[256], err_msg_db[256];
 static bool in_memory_warning;
@@ -216,13 +222,16 @@ void dash_init(void)
         lv_obj_set_style_bg_color(window, lv_color_make(0,0,0), LV_PART_MAIN);
         lv_obj_t *label = lv_label_create(window);
         lv_obj_center(label);
-        lv_label_set_text_static(label, "Rebuilding Database, please wait...");
+        lv_label_set_text_static(label, "Rebuilding Database, please wait...1");
+
         lv_obj_set_style_text_color(label, lv_color_white(), LV_PART_MAIN);
+        
         int *complete = lv_mem_alloc(sizeof (int));
         *complete = 0;
         label->user_data = complete;
         SDL_CreateThread(db_rebuild_progress_thread_f, "db_rebuild_progress_thread_f", label);
         SDL_CreateThread(db_rebuild_thread_f, "db_rebuild_thread_f", complete);
+
     }
     return;
 }

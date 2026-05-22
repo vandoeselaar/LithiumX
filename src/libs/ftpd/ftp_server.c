@@ -32,6 +32,13 @@
 
 #include "lwip/opt.h"
 #include "lwip/api.h"
+#include "lwip/tcp.h"
+
+// SOF_REUSEADDR is 0x04 in every lwIP version; define it if the build
+// environment does not expose it through the headers above.
+#ifndef SOF_REUSEADDR
+#define SOF_REUSEADDR 0x04
+#endif
 
 static const char *ftp_user_name = FTP_USER_NAME_DEFAULT;
 static const char *ftp_user_pass = FTP_USER_PASS_DEFAULT;
@@ -140,29 +147,26 @@ static int8_t date_time_get(char *parameters, uint16_t *pdate, uint16_t *ptime)
 
 static int ftp_read_command(ftp_data_t *ftp)
 {
-	// loop and check for packet every second
+	// If recv timeout is supported by this lwIP build, loop up to FTP_TIME_OUT_S
+	// seconds waiting for a command. Otherwise block directly — netconn_recv will
+	// return an error (ERR_CLSD, ERR_CONN, etc.) when the client disconnects.
+#ifdef netconn_set_recvtimeout
 	for (uint32_t i = 0; i < FTP_TIME_OUT_S; i++)
 	{
-		// receive data
 		int8_t net_err = netconn_recv(ftp->ctrlconn, &ftp->inbuf);
-
-		// reception was ok?
 		if (net_err == ERR_OK)
-		{
 			return 0;
-		}
-
-		// other error than timeout?
 		if (net_err != ERR_TIMEOUT)
 			break;
-
-		// link down?
 		if (!ftp_eth_is_connected())
 			break;
 	}
-
-	// all good
 	return -1;
+#else
+	// No timeout support: block until data arrives or the connection drops.
+	int8_t net_err = netconn_recv(ftp->ctrlconn, &ftp->inbuf);
+	return (net_err == ERR_OK) ? 0 : -1;
+#endif
 }
 
 // =========================================================
@@ -274,6 +278,10 @@ static int pasv_con_open(ftp_data_t *ftp)
 		FTP_CONN_DEBUG(ftp, "Error in opening listening con, creation failed\r\n");
 		return -1;
 	}
+
+	// Allow reuse of the port while it is in TIME_WAIT so rapid reconnects succeed.
+	// lwIP exposes this via the internal PCB flag ip_set_option / SO_REUSEADDR.
+	ip_set_option(ftp->listdataconn->pcb.tcp, SOF_REUSEADDR);
 
 	// Bind listdataconn to port (FTP_DATA_PORT + num) with default IP address
 	int8_t err = netconn_bind(ftp->listdataconn, IP_ADDR_ANY, ftp->data_port);
@@ -772,8 +780,14 @@ static void ftp_cmd_list(ftp_data_t *ftp)
 		{
 			snprintf(dir_name_buf, _MAX_LFN, "-rw-r--r-- 1 XBOX XBOX %u %s %s\n", ftp->finfo.fsize, date_str, fname);
 		}
-		// write data to endpoint
-		netconn_write(ftp->dataconn, dir_name_buf, strlen(dir_name_buf), NETCONN_COPY);
+		// write data to endpoint; abort on error
+		if (netconn_write(ftp->dataconn, dir_name_buf, strlen(dir_name_buf), NETCONN_COPY) != ERR_OK)
+		{
+			FTP_CONN_DEBUG(ftp, "Error writing directory entry, aborting LIST\r\n");
+			data_con_close(ftp);
+			ftp_send(ftp, "426 Connection closed; transfer aborted\r\n");
+			return;
+		}
 	}
 
 	// close data connection
@@ -1388,7 +1402,7 @@ static void ftp_cmd_size(ftp_data_t *ftp)
 	else
 	{
 		ftp_send(ftp, "213 %lu\r\n", ftp->finfo.fsize);
-		ftps_f_close(&ftp->file);
+		// Note: ftps_f_stat does not open ftp->file, so no close needed here
 	}
 
 	// go up a level again
@@ -1598,8 +1612,12 @@ void ftp_service(struct netconn *ctrlcn, ftp_data_t *ftp)
 	// feedback
 	FTP_CONN_DEBUG(ftp, "Client connected!\r\n");
 
-	// Set disconnection timeout to one second
-	// netconn_set_recvtimeout(ftp->ctrlconn, 1000);
+	// Set control connection receive timeout to 1 second so ftp_read_command
+	// can loop properly. netconn_set_recvtimeout may not be available in all
+	// lwIP builds; set the PCB field directly as a fallback.
+#ifdef netconn_set_recvtimeout
+	netconn_set_recvtimeout(ftp->ctrlconn, 1000);
+#endif
 
 	// loop until quit command
 	while (1)

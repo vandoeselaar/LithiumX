@@ -142,6 +142,7 @@ typedef struct
     void *db_scan_thread;
     lv_obj_t *tile;     // The tile in the tileview parent 'pagetiles'
     lv_obj_t *scroller; // The scroller contains image containers for each item
+    volatile bool scan_done; // true when db_scan_thread_f is finished
 } parse_handle_t;
 
 typedef struct
@@ -191,6 +192,11 @@ void dash_focus_set_final(lv_obj_t *focus);
 void dash_focus_change_depth(lv_obj_t *new_focus);
 lv_obj_t *dash_focus_pop_depth();
 void dash_focus_change(lv_obj_t *new_obj);
+
+extern volatile bool splash_active;
+void platform_splash_overlay(void);
+void platform_splash_done(void);
+void platform_splash_set_status(const char *msg);
 
 extern toml_table_t *dash_search_paths;
 extern dash_settings_t dash_settings;

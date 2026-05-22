@@ -18,14 +18,31 @@ void dash_styles_init(lv_color_t theme_colour)
 {
     dash_base_theme_color = theme_colour;
 
-    //lv_color_make(22, 111, 15)
+    // Bepaal de achtergrondkleur: aangepaste kleur heeft voorrang boven de
+    // theme gradient. background_colour == -1 betekent "niet ingesteld".
+    bool has_custom_bg = DASH_BG_COLOUR_IS_SET(dash_settings.background_colour);
+    lv_color_t bg_colour = has_custom_bg
+        ? lv_color_make(DASH_BG_COLOUR_R(dash_settings.background_colour),
+                        DASH_BG_COLOUR_G(dash_settings.background_colour),
+                        DASH_BG_COLOUR_B(dash_settings.background_colour))
+        : lv_color_make(15, 15, 15);
+
     // Set the style for the background
     lv_style_init(&dash_background_style);
     lv_style_set_border_width(&dash_background_style, 0);
     lv_style_set_radius(&dash_background_style, 0);
-    lv_style_set_bg_color(&dash_background_style, lv_color_make(15, 15, 15));
-    lv_style_set_bg_grad_color(&dash_background_style, theme_colour);
-    lv_style_set_bg_grad_dir(&dash_background_style, LV_GRAD_DIR_VER);
+    lv_style_set_bg_color(&dash_background_style, bg_colour);
+    if (has_custom_bg)
+    {
+        // Effen kleur: geen gradient
+        lv_style_set_bg_grad_dir(&dash_background_style, LV_GRAD_DIR_NONE);
+    }
+    else
+    {
+        // Standaard gradient van donkergrijs naar theme colour
+        lv_style_set_bg_grad_color(&dash_background_style, theme_colour);
+        lv_style_set_bg_grad_dir(&dash_background_style, LV_GRAD_DIR_VER);
+    }
 
     // Set the style for the main menu container
     lv_style_init(&menu_table_style);

@@ -99,6 +99,12 @@ SRCS += $(shell find -L $(LVGL_DIR)/src/hal -name \*.c)
 SRCS += $(shell find -L $(LVGL_DIR)/src/misc -name \*.c)
 SRCS += $(shell find -L $(LVGL_DIR)/src/widgets -name \*.c)
 
+# XISO assets
+$(GEN_XISO): $(OUTPUT_DIR)/splash.jpg
+
+$(OUTPUT_DIR)/splash.jpg: $(CURDIR)/assets/splash.jpg $(OUTPUT_DIR)
+	cp $(CURDIR)/assets/splash.jpg $(OUTPUT_DIR)/splash.jpg
+
 include $(NXDK_DIR)/Makefile
 
 clean_local:

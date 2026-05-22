@@ -2,12 +2,19 @@
 
 #include <hal/video.h>
 #include <hal/debug.h>
+#include <string.h>
 #include <lvgl.h>
 #include <src/misc/lv_lru.h>
 #include "libs/xgu/xgu.h"
 #include "libs/xgu/xgux.h"
 #include "../../lv_port_disp.h"
 #include "lv_xgu_draw.h"
+
+extern volatile bool splash_active;
+extern uint32_t *splash_fb_buf;
+extern int splash_screen_w, splash_screen_h;
+
+extern volatile bool lvgl_frame_ready;
 
 static lv_disp_drv_t disp_drv;
 static lv_disp_draw_buf_t draw_buf;
@@ -29,21 +36,36 @@ static void begin_frame()
 {
     pb_reset();
     pb_target_back_buffer();
+    
     p = pb_begin();
     p = xgu_set_color_clear_value(p, 0xff000000);
+    // Clear the canvas natively via hardware for the upcoming drawing operations
     p = xgu_clear_surface(p, XGU_CLEAR_Z | XGU_CLEAR_STENCIL | XGU_CLEAR_COLOR);
     pb_end(p);
+}
+
+// lv_xgu_disp.c — disp_flush
+// lv_xgu_disp.c
+static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p)
+{
+    end_frame();          // GPU klaar, backbuffer is nu veilig
+    lvgl_frame_ready = true;
+
+    // GPU is gestopt, swap nog niet gebeurd
+    if (splash_active && splash_fb_buf) {
+        uint32_t *bb = (uint32_t *)pb_back_buffer();
+        if (bb) {
+            memcpy(bb, splash_fb_buf, splash_screen_w * splash_screen_h * sizeof(uint32_t));
+        }
+    }
+
+    begin_frame();        // GPU start nieuwe frame — backbuffer niet meer aanraken
+    lv_disp_flush_ready(disp_drv);
 }
 
 void lvgl_getlock(void);
 void lvgl_removelock(void);
 
-static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p)
-{
-    end_frame();
-    begin_frame();
-    lv_disp_flush_ready(disp_drv);
-}
 
 void lv_port_disp_init(int width, int height)
 {
@@ -70,10 +92,21 @@ void lv_port_disp_init(int width, int height)
     {
         pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false);
     }
-    pb_init();
-    pb_show_front_screen();
+pb_init();
+pb_show_front_screen();
 
-    p = pb_begin();
+// Meteen splash tonen zodat er geen zwart frame is
+if (splash_active && splash_fb_buf) {
+    // Schrijf splash naar backbuffer
+    uint32_t *bb = (uint32_t *)pb_back_buffer();
+    if (bb) {
+        memcpy(bb, splash_fb_buf, splash_screen_w * splash_screen_h * sizeof(uint32_t));
+    }
+    // Swap naar frontbuffer — begin_frame() volgt daarna pas
+    pb_wait_for_vbl();
+}
+
+p = pb_begin();
 
     #include "lvgl_drivers/video/xgu/notexture.inl"
     data->combiner_mode = 0;
