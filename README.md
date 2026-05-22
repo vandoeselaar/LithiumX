@@ -1,7 +1,7 @@
 # LithiumX
 
 A simple dashboard, mainly developed for the Original Xbox console, but it can be compiled for Windows and Linux for rapid development and testing.
-
+<img src="./assets/splash.jpg alt="loading splash" width="50%"/>
 <img  src="./images/dash_main.jpg" alt="main" width="50%"/>
 
 ## Features
